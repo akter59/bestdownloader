@@ -20,38 +20,51 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 COOKIE_FILE = os.path.join(BASE_DIR, 'cookies.txt')
 if os.environ.get('YOUTUBE_COOKIES'):
     try:
+        raw_cookies = os.environ['YOUTUBE_COOKIES'].strip()
+        # Fix escaped newlines if pasted from web inputs
+        if '\\n' in raw_cookies and '\n' not in raw_cookies:
+            raw_cookies = raw_cookies.replace('\\n', '\n')
+        if not raw_cookies.startswith('# Netscape HTTP Cookie File'):
+            raw_cookies = '# Netscape HTTP Cookie File\n' + raw_cookies
         with open(COOKIE_FILE, 'w', encoding='utf-8') as cf:
-            cf.write(os.environ['YOUTUBE_COOKIES'].strip())
-    except Exception:
-        pass
+            cf.write(raw_cookies)
+        print("  ✅ কুকি সফলভাবে লোড করা হয়েছে (Cookies successfully loaded).")
+    except Exception as e:
+        print(f"  ⚠️ কুকি ফাইল লেখায় সমস্যা: {e}")
 
-# Check if ffmpeg is available (check imageio_ffmpeg first, then system PATH)
+# Check if ffmpeg is available
 FFMPEG_PATH = None
 
 def init_ffmpeg():
     global FFMPEG_PATH
+    # First check system PATH
+    sys_ffmpeg = shutil.which('ffmpeg')
+    if sys_ffmpeg:
+        return sys_ffmpeg
     try:
         import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        try:
-            print("  ⚙️ FFmpeg মডিউল (imageio-ffmpeg) স্বয়ংক্রিয়ভাবে ইনস্টল করা হচ্ছে...")
-            import subprocess, sys
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio-ffmpeg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            import imageio_ffmpeg
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception as e:
-            print(f"  ⚠️ imageio-ffmpeg ইনস্টল করা যায়নি: {e}")
-            return None
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            try:
+                import stat
+                st = os.stat(exe)
+                os.chmod(exe, st.st_mode | stat.S_IEXEC)
+            except Exception:
+                pass
+            return exe
+    except Exception as e:
+        print(f"  ⚠️ imageio-ffmpeg লোড করা যায়নি: {e}")
+    return None
 
-FFMPEG_PATH = init_ffmpeg() or shutil.which('ffmpeg')
+FFMPEG_PATH = init_ffmpeg()
 HAS_FFMPEG = FFMPEG_PATH is not None
 
 # Node.js runtime detection for YouTube JS challenge solver (ejs)
 def find_node():
-    n = shutil.which('node') or shutil.which('nodejs')
-    if n:
-        return n
+    for name in ['node', 'nodejs', 'deno', 'bun']:
+        n = shutil.which(name)
+        if n:
+            return n
     possible_paths = [
         # Linux / Hostinger / Cloud server paths
         '/usr/bin/node',
@@ -65,8 +78,10 @@ def find_node():
         'C:\\Program Files (x86)\\nodejs\\node.exe',
     ]
     for p in possible_paths:
-        if os.path.exists(p):
-            return p
+        import glob
+        matches = glob.glob(p)
+        if matches:
+            return matches[0]
     return None
 
 NODE_PATH = find_node()
