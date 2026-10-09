@@ -18,19 +18,33 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Cookie file support for YouTube Bot Check bypass
 COOKIE_FILE = os.path.join(BASE_DIR, 'cookies.txt')
-if os.environ.get('YOUTUBE_COOKIES'):
-    try:
-        raw_cookies = os.environ['YOUTUBE_COOKIES'].strip()
-        # Fix escaped newlines if pasted from web inputs
-        if '\\n' in raw_cookies and '\n' not in raw_cookies:
-            raw_cookies = raw_cookies.replace('\\n', '\n')
-        if not raw_cookies.startswith('# Netscape HTTP Cookie File'):
-            raw_cookies = '# Netscape HTTP Cookie File\n' + raw_cookies
-        with open(COOKIE_FILE, 'w', encoding='utf-8') as cf:
-            cf.write(raw_cookies)
-        print("  ✅ কুকি সফলভাবে লোড করা হয়েছে (Cookies successfully loaded).")
-    except Exception as e:
-        print(f"  ⚠️ কুকি ফাইল লেখায় সমস্যা: {e}")
+
+def get_cookie_file():
+    """Detect and return valid cookie file path from env var or filesystem."""
+    env_cookies = os.environ.get('YOUTUBE_COOKIES') or os.environ.get('COOKIES')
+    if env_cookies:
+        try:
+            raw = env_cookies.strip()
+            if '\\n' in raw and '\n' not in raw:
+                raw = raw.replace('\\n', '\n')
+            if not raw.startswith('# Netscape HTTP Cookie File'):
+                raw = '# Netscape HTTP Cookie File\n' + raw
+            with open(COOKIE_FILE, 'w', encoding='utf-8') as cf:
+                cf.write(raw)
+            return COOKIE_FILE
+        except Exception as e:
+            print(f"  ⚠️ Error writing env cookies: {e}")
+
+    possible_files = [
+        COOKIE_FILE,
+        os.path.join(BASE_DIR, 'cookie.txt'),
+        'cookies.txt',
+        'cookie.txt'
+    ]
+    for pf in possible_files:
+        if os.path.exists(pf) and os.path.getsize(pf) > 0:
+            return os.path.abspath(pf)
+    return None
 
 # Check if ffmpeg is available
 FFMPEG_PATH = None
@@ -140,9 +154,15 @@ def get_base_ydl_opts():
         'nocheckcertificate': True,
         'geo_bypass': True,
         'remote_components': ['ejs:github'],
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['web', 'mweb', 'android']
+            }
+        }
     }
-    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
-        opts['cookiefile'] = COOKIE_FILE
+    cookie_path = get_cookie_file()
+    if cookie_path:
+        opts['cookiefile'] = cookie_path
     if NODE_PATH and os.path.exists(NODE_PATH):
         opts['js_runtimes'] = {'node': {'path': NODE_PATH}}
     if FFMPEG_PATH:
@@ -164,28 +184,44 @@ def get_video_info():
     ydl_opts = get_base_ydl_opts()
     ydl_opts['skip_download'] = True
 
+    info = None
+    last_err = None
+
+    # Tier 1: Try default cascading client (web -> mweb -> android)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        err_msg = str(e)
-        if any(keyword in err_msg for keyword in ["403", "Forbidden", "Sign in", "bot", "Sign in to confirm", "Please sign in"]):
-            try:
-                # Automatic fallback to mobile client which bypasses bot challenges
-                fallback_opts = dict(ydl_opts)
-                fallback_opts['extractor_args'] = {
-                    'youtube': {
-                        'player_client': ['android', 'ios']
-                    }
+        last_err = e
+
+    # Tier 2: Force Android client directly
+    if not info:
+        try:
+            fallback_opts = dict(ydl_opts)
+            fallback_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e2:
+            last_err = e2
+
+    # Tier 3: Skip webpage & configs with Android client
+    if not info:
+        try:
+            fallback_opts2 = dict(ydl_opts)
+            fallback_opts2['extractor_args'] = {
+                'youtube': {
+                    'player_skip': ['webpage', 'configs'],
+                    'player_client': ['android']
                 }
-                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-            except Exception as e2:
-                err_msg2 = str(e2)
-                if any(k in err_msg2 for k in ["bot", "Sign in", "login"]):
-                    return jsonify({'error': 'ইউটিউব বট ভেরিফিকেশন (Bot Check) চাচ্ছে। এটি স্থায়ীভাবে সমাধান করতে একটি cookies.txt ফাইল প্রজেক্টে যুক্ত করুন। অথবা অন্য কোনো ভিডিও দিয়ে চেষ্টা করুন।'}), 400
-                return jsonify({'error': f'ভিডিও তথ্য সংগ্রহ করা সম্ভব হয়নি: {err_msg2}'}), 400
-        elif "Private video" in err_msg or "login" in err_msg.lower():
+            }
+            with yt_dlp.YoutubeDL(fallback_opts2) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e3:
+            last_err = e3
+
+    if not info:
+        err_msg = str(last_err)
+        if "Private video" in err_msg or "login" in err_msg.lower():
             return jsonify({'error': 'এই ভিডিওটি প্রাইভেট অথবা লগইন প্রয়োজন।'}), 400
         elif "not a valid URL" in err_msg:
             return jsonify({'error': 'সঠিক ভিডিও লিঙ্ক প্রদান করুন।'}), 400
@@ -369,13 +405,12 @@ def download_video():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as first_err:
-            err_str = str(first_err)
-            if any(k in err_str for k in ["403", "Forbidden", "Sign in", "bot", "Sign in to confirm", "Please sign in"]):
-                # Bot challenge or 403 Forbidden fallback: retry with mobile clients
+            try:
+                # Bot challenge or restriction fallback: retry with android client
                 fallback_opts = dict(ydl_opts)
                 fallback_opts['extractor_args'] = {
                     'youtube': {
-                        'player_client': ['android', 'ios']
+                        'player_client': ['android']
                     }
                 }
                 if download_type == 'audio':
@@ -392,8 +427,22 @@ def download_video():
 
                 with yt_dlp.YoutubeDL(fallback_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-            else:
-                raise first_err
+            except Exception as second_err:
+                # Final fallback without webpage/configs
+                fallback_opts2 = dict(ydl_opts)
+                fallback_opts2['extractor_args'] = {
+                    'youtube': {
+                        'player_skip': ['webpage', 'configs'],
+                        'player_client': ['android']
+                    }
+                }
+                if download_type == 'audio':
+                    fallback_opts2['format'] = 'bestaudio/best'
+                else:
+                    fallback_opts2['format'] = f'best[height<={h}]/best'
+
+                with yt_dlp.YoutubeDL(fallback_opts2) as ydl:
+                    info = ydl.extract_info(url, download=True)
 
         format_note = info.get('format_note') or info.get('resolution') or f"{info.get('width')}x{info.get('height')}"
         print(f"  📥 ডাউনলোড সম্পন্ন: '{info.get('title')}' | কোয়ালিটি: {format_note} | ফরম্যাট: {info.get('ext')}")
