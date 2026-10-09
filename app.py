@@ -16,6 +16,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, 'downloads')
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Cookie file support for YouTube Bot Check bypass
+COOKIE_FILE = os.path.join(BASE_DIR, 'cookies.txt')
+if os.environ.get('YOUTUBE_COOKIES'):
+    try:
+        with open(COOKIE_FILE, 'w', encoding='utf-8') as cf:
+            cf.write(os.environ['YOUTUBE_COOKIES'].strip())
+    except Exception:
+        pass
+
 # Check if ffmpeg is available (check imageio_ffmpeg first, then system PATH)
 FFMPEG_PATH = None
 
@@ -117,6 +126,8 @@ def get_base_ydl_opts():
         'geo_bypass': True,
         'remote_components': ['ejs:github'],
     }
+    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+        opts['cookiefile'] = COOKIE_FILE
     if NODE_PATH and os.path.exists(NODE_PATH):
         opts['js_runtimes'] = {'node': {'path': NODE_PATH}}
     if FFMPEG_PATH:
@@ -143,13 +154,22 @@ def get_video_info():
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         err_msg = str(e)
-        if "403" in err_msg or "Forbidden" in err_msg:
+        if any(keyword in err_msg for keyword in ["403", "Forbidden", "Sign in", "bot", "Sign in to confirm", "Please sign in"]):
             try:
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv', 'mweb', 'ios', 'android']}}
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Automatic fallback to mobile client which bypasses bot challenges
+                fallback_opts = dict(ydl_opts)
+                fallback_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['android', 'ios']
+                    }
+                }
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
             except Exception as e2:
-                return jsonify({'error': 'ইউটিউব দ্বারা অ্যাক্সেস সাময়িক ব্লক (403 Forbidden) হয়েছে। লাইব্রেরি আপডেট করতে "pip install -U yt-dlp" কমান্ড দিয়ে পুনরায় চালু করুন।'}), 400
+                err_msg2 = str(e2)
+                if any(k in err_msg2 for k in ["bot", "Sign in", "login"]):
+                    return jsonify({'error': 'ইউটিউব বট ভেরিফিকেশন (Bot Check) চাচ্ছে। এটি স্থায়ীভাবে সমাধান করতে একটি cookies.txt ফাইল প্রজেক্টে যুক্ত করুন। অথবা অন্য কোনো ভিডিও দিয়ে চেষ্টা করুন।'}), 400
+                return jsonify({'error': f'ভিডিও তথ্য সংগ্রহ করা সম্ভব হয়নি: {err_msg2}'}), 400
         elif "Private video" in err_msg or "login" in err_msg.lower():
             return jsonify({'error': 'এই ভিডিওটি প্রাইভেট অথবা লগইন প্রয়োজন।'}), 400
         elif "not a valid URL" in err_msg:
@@ -335,12 +355,12 @@ def download_video():
                 info = ydl.extract_info(url, download=True)
         except Exception as first_err:
             err_str = str(first_err)
-            if "403" in err_str or "Forbidden" in err_str:
-                # 403 Forbidden fallback: retry without downgrading quality
+            if any(k in err_str for k in ["403", "Forbidden", "Sign in", "bot", "Sign in to confirm", "Please sign in"]):
+                # Bot challenge or 403 Forbidden fallback: retry with mobile clients
                 fallback_opts = dict(ydl_opts)
                 fallback_opts['extractor_args'] = {
                     'youtube': {
-                        'player_client': ['tv', 'mweb', 'android', 'ios']
+                        'player_client': ['android', 'ios']
                     }
                 }
                 if download_type == 'audio':
